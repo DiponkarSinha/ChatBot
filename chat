@@ -1,17 +1,22 @@
+import re
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import re
 
-# ====== CONFIG ======
-CSV_PATH = "your_data.csv"
+# ===================== CONFIG =====================
+CSV_PATH = "your_data.csv"   # <-- set your file path
 
+# Keep only these brands (set KEEP_ONLY_BRANDS=False to match Excel if Excel used all brands)
+KEEP_ONLY_BRANDS = True
 BRANDS = [
     'bmw','volkswagen','mercedes-benz ag','volvo','toyota','ford','stellantis','nissan',
     'kia','renault','byd','tesla','mazda','hyundai','polestar','gm','jlr','subaru'
 ]
-POWERTRAIN_KEEP = {'BEV','PHEV','MHEV','FCEVs'}
 
+# Powertrain filter (set to None to disable and match Excel if Excel wasn’t filtered)
+POWERTRAIN_KEEP = None             # e.g. {'BEV','PHEV','MHEV','FCEVs'} or None
+
+# Your file’s headers → canonical column names we’ll use
 RENAME = {
     'Motor_Size_in_cc': 'Motor_cc',
     'Motor_Power_in_kw': 'Power_kW',
@@ -22,70 +27,108 @@ RENAME = {
     'Vehicle_List_Price_including_Discounts_in_USD': 'Price_USD',
 }
 
-NUMERIC_COLS = ['Motor_cc','Power_kW','CO2_g_per_km','Fuel_L_per_100km',
-                'Elec_kWh_per_100km','ERange_km','Price_USD']
+NUMERIC_COLS = [
+    'Motor_cc','Power_kW','CO2_g_per_km','Fuel_L_per_100km',
+    'Elec_kWh_per_100km','ERange_km','Price_USD'
+]
 
+# “Lower is better” metrics for normalization/inversion:
 LOWER_IS_BETTER = {'CO2_g_per_km','Fuel_L_per_100km','Elec_kWh_per_100km','Price_USD'}
 
-# ====== HELPERS ======
-def to_number(series):
+DEBUG = True  # set False to silence debug prints
+# ===================================================
+
+def to_number(series: pd.Series) -> pd.Series:
+    """Coerce '$12,345', '15 kW', '—' to numeric; blanks → NaN (Excel-like)."""
     def _clean(x):
         if pd.isna(x): return pd.NA
         s = str(x).strip()
-        if s in {"", "-", "--", "NA", "N/A", "nan"}: return pd.NA
-        s = re.sub(r"[,$£€]", "", s)
-        s = re.sub(r"[a-zA-Z%()]", "", s)
+        if s in {"", "-", "—", "--", "NA", "N/A", "nan"}: return pd.NA
+        s = re.sub(r"[,$£€]", "", s)          # currency
+        s = re.sub(r"[a-zA-Z%()]", "", s)     # unit text
         s = s.replace(" ", "")
         return s
     s = series.map(_clean)
     return pd.to_numeric(s, errors="coerce")
 
-def minmax(s):
+def minmax(s: pd.Series) -> pd.Series:
     lo, hi = s.min(), s.max()
     return (s - lo) / (hi - lo + 1e-12)
 
-# ====== LOAD & CLEAN ======
+# -------------------- LOAD & PREP --------------------
 df = pd.read_csv(CSV_PATH)
+if DEBUG: print("DEBUG original columns:", list(df.columns))
+
+# rename headers to canonical
 df = df.rename(columns=RENAME)
+if DEBUG: print("DEBUG after rename   :", list(df.columns))
+
+# brand filter (only if requested)
+if 'Bidder_Name' not in df.columns:
+    raise ValueError("Required column 'Bidder_Name' not found.")
 df['Bidder_Name'] = df['Bidder_Name'].astype(str).str.strip().str.lower()
-df = df[df['Bidder_Name'].isin(BRANDS)]
+if KEEP_ONLY_BRANDS:
+    before = len(df)
+    df = df[df['Bidder_Name'].isin(BRANDS)]
+    if DEBUG: print(f"DEBUG brand filter  : {before} -> {len(df)} rows")
+
+# powertrain filter (optional)
 if POWERTRAIN_KEEP and 'Power_Train' in df.columns:
+    before = len(df)
     df = df[df['Power_Train'].isin(POWERTRAIN_KEEP)]
-for c in NUMERIC_COLS:
-    if c in df.columns:
-        df[c] = to_number(df[c])
+    if DEBUG: print(f"DEBUG powertrain filt: {before} -> {len(df)} rows")
 
-# ====== PER BRAND AVERAGES ======
-brand_avg = df.groupby('Bidder_Name', as_index=False)[NUMERIC_COLS].mean()
+# numeric coercion (column-wise, Excel-like)
+present = [c for c in NUMERIC_COLS if c in df.columns]
+missing  = [c for c in NUMERIC_COLS if c not in df.columns]
+if DEBUG and missing:
+    print("⚠️ Missing numeric columns (not used):", missing)
+for c in present:
+    df[c] = to_number(df[c])
 
-# ====== NORMALIZATION ======
-for c in NUMERIC_COLS:
-    norm_col = f"{c}_norm"
-    if c in LOWER_IS_BETTER:
-        brand_avg[norm_col] = 1 - minmax(brand_avg[c])
-    else:
-        brand_avg[norm_col] = minmax(brand_avg[c])
+# -------------------- PER-BRAND AVERAGES (RAW) --------------------
+# Excel-style per-brand averages: column-wise mean, NaNs ignored, zeros included.
+if not present:
+    raise ValueError("No numeric columns found after renaming; cannot proceed.")
 
-# ====== SCORE & RANK ======
-norm_cols = [f"{c}_norm" for c in NUMERIC_COLS]
-brand_avg['Score'] = brand_avg[norm_cols].mean(axis=1)
-brand_avg['Rank'] = brand_avg['Score'].rank(ascending=False, method='min').astype(int)
-brand_avg = brand_avg.sort_values('Rank')
+brand_avg = df.groupby('Bidder_Name', as_index=False)[present].mean()
 
-# ====== FULL TABLE VIEW ======
+# If brand_avg is empty, show why and exit early
+if brand_avg.empty:
+    raise ValueError("No data after filters. Check brand names/powertrain filter and input file.")
+
+# -------------------- NORMALIZATION & SCORE --------------------
+# Create normalized columns next to raw averages
+for c in present:
+    ncol = f"{c}_norm"
+    brand_avg[ncol] = (1 - minmax(brand_avg[c])) if c in LOWER_IS_BETTER else minmax(brand_avg[c])
+
+norm_cols = [f"{c}_norm" for c in present]
+brand_avg['Score'] = brand_avg[norm_cols].mean(axis=1).fillna(0.0)
+brand_avg['Rank']  = brand_avg['Score'].rank(ascending=False, method='min').astype(int)
+brand_avg = brand_avg.sort_values(['Rank','Bidder_Name']).reset_index(drop=True)
+
+# -------------------- TABULAR VIEW --------------------
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)
-print("\n=== Per Brand Averages, Normalized Metrics, Score, Rank ===")
+print("\n=== Per-Brand Averages + Normalized Metrics + Score + Rank ===")
 print(brand_avg.to_string(index=False))
 
-# ====== PLOT TOP 10 ======
+# -------------------- TOP-10 CHART --------------------
 top10 = brand_avg.head(10)
-plt.figure(figsize=(10,6))
-sns.barplot(data=top10, x='Score', y='Bidder_Name', palette='viridis')
+plt.figure(figsize=(10, 6))
+sns.barplot(data=top10, x='Score', y='Bidder_Name')
 for i, v in enumerate(top10['Score']):
-    plt.text(v + 0.005, i, f"{v*100:.2f}%", va='center', fontsize=10, fontweight='bold')
+    plt.text(float(v) + 0.005, i, f"{v*100:.2f}%", va='center', fontsize=10, fontweight='bold')
 plt.title('Top 10 Brands with Highest Customer Value')
 plt.xlabel('Score')
 plt.ylabel('Brand')
 plt.tight_layout()
 plt.show()
+
+# -------------------- OPTIONAL DEBUG to reconcile with Excel --------------------
+if DEBUG:
+    # Column-wise means across ALL rows, no filters (for sanity check)
+    overall_excel_like = {c: to_number(df[c]).mean() for c in present}
+    print("\nDEBUG overall column means (Excel-like):")
+    print(overall_excel_like)
