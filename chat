@@ -1,15 +1,16 @@
-import re
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import re
 
+# ====== CONFIG ======
 CSV_PATH = "your_data.csv"
 
 BRANDS = [
     'bmw','volkswagen','mercedes-benz ag','volvo','toyota','ford','stellantis','nissan',
     'kia','renault','byd','tesla','mazda','hyundai','polestar','gm','jlr','subaru'
 ]
-POWERTRAIN_KEEP = {'BEV','PHEV','MHEV','FCEVs'}  # set to None to skip this filter
+POWERTRAIN_KEEP = {'BEV','PHEV','MHEV','FCEVs'}
 
 RENAME = {
     'Motor_Size_in_cc': 'Motor_cc',
@@ -21,14 +22,13 @@ RENAME = {
     'Vehicle_List_Price_including_Discounts_in_USD': 'Price_USD',
 }
 
-REQUIRED = ['Bidder_Name','Motor_cc','Power_kW','CO2_g_per_km',
-            'Fuel_L_per_100km','Elec_kWh_per_100km','ERange_km','Price_USD']
+NUMERIC_COLS = ['Motor_cc','Power_kW','CO2_g_per_km','Fuel_L_per_100km',
+                'Elec_kWh_per_100km','ERange_km','Price_USD']
 
 LOWER_IS_BETTER = {'CO2_g_per_km','Fuel_L_per_100km','Elec_kWh_per_100km','Price_USD'}
 
-DEBUG = True
-
-def to_number(series: pd.Series) -> pd.Series:
+# ====== HELPERS ======
+def to_number(series):
     def _clean(x):
         if pd.isna(x): return pd.NA
         s = str(x).strip()
@@ -40,96 +40,50 @@ def to_number(series: pd.Series) -> pd.Series:
     s = series.map(_clean)
     return pd.to_numeric(s, errors="coerce")
 
-def minmax(s: pd.Series) -> pd.Series:
+def minmax(s):
     lo, hi = s.min(), s.max()
     return (s - lo) / (hi - lo + 1e-12)
 
-# -------------------- MAIN --------------------
+# ====== LOAD & CLEAN ======
 df = pd.read_csv(CSV_PATH)
-if DEBUG: print("DEBUG: original columns:", list(df.columns))
-
 df = df.rename(columns=RENAME)
-if DEBUG: print("DEBUG: after renaming  :", list(df.columns))
-
-# Brand/powertrain filters
-if 'Bidder_Name' not in df.columns:
-    raise ValueError("Required column 'Bidder_Name' not found.")
 df['Bidder_Name'] = df['Bidder_Name'].astype(str).str.strip().str.lower()
-df = df[df['Bidder_Name'].isin(BRANDS)].copy()
+df = df[df['Bidder_Name'].isin(BRANDS)]
 if POWERTRAIN_KEEP and 'Power_Train' in df.columns:
-    df = df[df['Power_Train'].isin(POWERTRAIN_KEEP)].copy()
-if df.empty:
-    raise ValueError("No rows remain after brand/powertrain filters.")
-
-# Split required into ID vs numeric
-NUMERIC_COLS = [c for c in REQUIRED if c != 'Bidder_Name' and c in df.columns]
-MISSING = [c for c in REQUIRED if c not in df.columns]
-if DEBUG and MISSING: print("⚠️ Missing required columns (skipped):", MISSING)
-
-# Coerce only numeric columns
+    df = df[df['Power_Train'].isin(POWERTRAIN_KEEP)]
 for c in NUMERIC_COLS:
-    df[c] = to_number(df[c])
+    if c in df.columns:
+        df[c] = to_number(df[c])
 
-# (Optional) treat zeros as invalid for these numeric fields
-# ZERO_BAD = {'Motor_cc','Power_kW','Fuel_L_per_100km','Price_USD'}
-# for c in ZERO_BAD & set(NUMERIC_COLS):
-#     df[c] = df[c].replace(0, pd.NA)
-
-# ---------- Reconciliation (now correct) ----------
-if DEBUG:
-    rows_total = len(df)
-    recs = []
-    for c in NUMERIC_COLS:
-        s_raw = df[c]
-        excel_like_mean = s_raw.mean()  # NaNs ignored, zeros included
-        s_col = s_raw  # if you enable ZERO_BAD above, apply the mask here
-        colwise_clean_mean = s_col.mean()
-        mask_valid_all = pd.Series(True, index=df.index)
-        for cc in NUMERIC_COLS:                 # <-- EXCLUDES Bidder_Name now
-            mask_valid_all &= df[cc].notna()
-        s_pipe = df.loc[mask_valid_all, c]
-        pipeline_mean = s_pipe.mean()
-        recs.append({
-            "column": c,
-            "rows_total": rows_total,
-            "excel_like_nonNaN": int(s_raw.notna().sum()),
-            "excel_like_mean": float(excel_like_mean) if pd.notna(excel_like_mean) else None,
-            "colwise_clean_nonNaN": int(s_col.notna().sum()),
-            "colwise_clean_mean": float(colwise_clean_mean) if pd.notna(colwise_clean_mean) else None,
-            "pipeline_rows_used": int(mask_valid_all.sum()),
-            "pipeline_mean": float(pipeline_mean) if pd.notna(pipeline_mean) else None,
-            "zeros_count": int((s_raw == 0).sum()),
-        })
-    recon = pd.DataFrame.from_records(recs)
-    print("\n=== Reconciliation: Excel-like vs Clean vs Pipeline ===")
-    with pd.option_context("display.max_rows", None, "display.width", None):
-        print(recon.to_string(index=False))
-
-# ---------- Per-brand averages ----------
+# ====== PER BRAND AVERAGES ======
 brand_avg = df.groupby('Bidder_Name', as_index=False)[NUMERIC_COLS].mean()
 
-# ---------- Normalize & score ----------
-norm_cols = []
+# ====== NORMALIZATION ======
 for c in NUMERIC_COLS:
-    ncol = f"{c}_norm"
-    brand_avg[ncol] = (1 - minmax(brand_avg[c])) if c in LOWER_IS_BETTER else minmax(brand_avg[c])
-    norm_cols.append(ncol)
+    norm_col = f"{c}_norm"
+    if c in LOWER_IS_BETTER:
+        brand_avg[norm_col] = 1 - minmax(brand_avg[c])
+    else:
+        brand_avg[norm_col] = minmax(brand_avg[c])
 
-brand_avg['Score'] = brand_avg[norm_cols].mean(axis=1).fillna(0.0)
+# ====== SCORE & RANK ======
+norm_cols = [f"{c}_norm" for c in NUMERIC_COLS]
+brand_avg['Score'] = brand_avg[norm_cols].mean(axis=1)
 brand_avg['Rank'] = brand_avg['Score'].rank(ascending=False, method='min').astype(int)
-brand_avg = brand_avg.sort_values(['Rank','Bidder_Name']).reset_index(drop=True)
+brand_avg = brand_avg.sort_values('Rank')
 
+# ====== FULL TABLE VIEW ======
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)
-print("\n=== Per-Brand Averages, Normalized Metrics, Score, Rank ===")
+print("\n=== Per Brand Averages, Normalized Metrics, Score, Rank ===")
 print(brand_avg.to_string(index=False))
 
-# ---------- Plot Top 10 ----------
+# ====== PLOT TOP 10 ======
 top10 = brand_avg.head(10)
-plt.figure(figsize=(10, 6))
+plt.figure(figsize=(10,6))
 sns.barplot(data=top10, x='Score', y='Bidder_Name', palette='viridis')
 for i, v in enumerate(top10['Score']):
-    plt.text(float(v) + 0.005, i, f"{v*100:.2f}%", va='center', fontsize=10, fontweight='bold')
+    plt.text(v + 0.005, i, f"{v*100:.2f}%", va='center', fontsize=10, fontweight='bold')
 plt.title('Top 10 Brands with Highest Customer Value')
 plt.xlabel('Score')
 plt.ylabel('Brand')
