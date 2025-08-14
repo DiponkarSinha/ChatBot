@@ -26,6 +26,14 @@ for col in NUM_COLS:
 zero_invalid_cols = ['Motor_cc', 'Power_kW', 'Fuel_L_per_100km', 'Price_USD']
 df[zero_invalid_cols] = df[zero_invalid_cols].replace(0, pd.NA)
 
+# --- Debug: Show rows with missing values ---
+print("\n=== DEBUG: Rows with missing or invalid values ===")
+for col in NUM_COLS:
+    bad_rows = df[df[col].isna()]
+    if not bad_rows.empty:
+        print(f"\n❌ Column '{col}' has {len(bad_rows)} bad rows:")
+        print(bad_rows[['Bidder_Name', col]].to_string(index=False))
+
 # --- Drop rows missing in any numeric column ---
 df = df.dropna(subset=NUM_COLS)
 
@@ -42,7 +50,7 @@ brand_avg['Motor_norm']     =     minmax(brand_avg['Motor_cc'])               # 
 brand_avg['CO2_norm']       = 1 - minmax(brand_avg['CO2_g_per_km'])           # lower better
 brand_avg['Fuel_norm']      = 1 - minmax(brand_avg['Fuel_L_per_100km'])       # lower better
 brand_avg['Elec_kWh_norm']  = 1 - minmax(brand_avg['Elec_kWh_per_100km'])     # lower better
-brand_avg['Power_norm']     =     minmax(brand_avg['Power_KW'])               # higher better
+brand_avg['Power_norm']     =     minmax(brand_avg['Power_kW'])               # higher better
 brand_avg['Price_norm']     = 1 - minmax(brand_avg['Price_USD'])              # lower better
 
 # --- Score ---
