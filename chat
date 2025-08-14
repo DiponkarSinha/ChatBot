@@ -1,15 +1,7 @@
+import re
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 
-# ------------------ CONFIG ------------------
-CSV_PATH = "your_data.csv"   # <- change to your file
-BRANDS = [
-    'bmw','volkswagen','mercedes-benz ag','volvo','toyota','ford','stellantis','nissan',
-    'kia','renault','byd','tesla','mazda','hyundai','polestar','gm','jlr','subaru'
-]
-
-# Map YOUR column names -> canonical names we’ll use below
+# --- 1) Column mapping for YOUR file ---
 RENAME = {
     'Motor_Size_in_cc': 'Motor_cc',
     'Motor_Power_in_kw': 'Power_kW',
@@ -19,86 +11,80 @@ RENAME = {
     'Electric_Range_in_km': 'ERange_km',
     'Vehicle_List_Price_including_Discounts_in_USD': 'Price_USD',
 }
+TARGET = ['Motor_cc','Power_kW','CO2_g_per_km','Fuel_L_per_100km','Elec_kWh_per_100km','ERange_km','Price_USD']
 
-REQUIRED = ['Bidder_Name','Motor_cc','CO2_g_per_km','Fuel_L_per_100km',
-            'Elec_kWh_per_100km','Power_kW','Price_USD','ERange_km']
+# columns where zero is not realistic and should be excluded in the "clean" views
+ZERO_BAD = {'Motor_cc','Power_kW','Fuel_L_per_100km','Price_USD'}
 
-LOWER_IS_BETTER = {'CO2_g_per_km','Fuel_L_per_100km','Elec_kWh_per_100km','Price_USD'}  # lower better
+# --- 2) Helper: strong numeric coercion (handles $ , kW, spaces, etc.) ---
+def to_number(series: pd.Series) -> pd.Series:
+    def _clean(x):
+        if pd.isna(x): return pd.NA
+        s = str(x).strip()
+        if s in {"", "-", "--", "NA", "N/A", "nan"}: return pd.NA
+        # remove currency and unit clutter; keep digits, dot, minus
+        s = re.sub(r"[,$£€\s]", "", s)
+        s = re.sub(r"[a-zA-Z_()%]+", "", s)  # drop trailing unit strings like "kW", "km"
+        return s
+    s = series.map(_clean)
+    return pd.to_numeric(s, errors="coerce")
 
-# ------------------ LOAD & RENAME ------------------
-df = pd.read_csv(CSV_PATH)
-print("DEBUG: original columns:\n", list(df.columns))
-
+# --- 3) Load + rename (assumes df already loaded; otherwise do df = pd.read_csv(...)) ---
+# df = pd.read_csv("your_data.csv")
 df = df.rename(columns=RENAME)
-print("\nDEBUG: after renaming:\n", list(df.columns))
 
-# Check presence
-missing = [c for c in REQUIRED if c not in df.columns]
-if missing:
-    print("\n⚠️ These required columns are missing and will be skipped in scoring:", missing)
+present = [c for c in TARGET if c in df.columns]
+if not present:
+    raise ValueError("None of the target numeric columns are present after renaming.")
 
-# ------------------ FILTER BRANDS ------------------
-df['Bidder_Name'] = df['Bidder_Name'].astype(str).str.strip().str.lower()
-df = df[df['Bidder_Name'].isin(BRANDS)].copy()
-if df.empty:
-    raise ValueError("No rows remain after brand filter. Check brand names.")
+# Coerce all target columns to numeric (robust)
+for c in present:
+    df[c] = to_number(df[c])
 
-# ------------------ NUMERIC CLEAN ------------------
-num_cols = [c for c in REQUIRED if c != 'Bidder_Name' and c in df.columns]
-for c in num_cols:
-    df[c] = pd.to_numeric(df[c], errors='coerce')
+# Optional: brand filter (uncomment and adjust if you filtered in Excel)
+# BRANDS = ['bmw','volkswagen','mercedes-benz ag','volvo','toyota','ford','stellantis','nissan','kia','renault','byd','tesla','mazda','hyundai','polestar','gm','jlr','subaru']
+# df['Bidder_Name'] = df['Bidder_Name'].astype(str).str.strip().str.lower()
+# df = df[df['Bidder_Name'].isin(BRANDS)].copy()
 
-# zeros → NA for fields that shouldn’t be zero
-for c in ['Motor_cc','Power_kW','Fuel_L_per_100km','Price_USD']:
-    if c in df.columns:
-        df[c] = df[c].replace(0, pd.NA)
+# --- 4) Build the three comparable means ---
+rows_total = len(df)
+records = []
+for c in present:
+    s_raw = df[c]
 
-# Debug: bad counts
-print("\nDEBUG: missing/invalid counts per numeric column:")
-for c in num_cols:
-    print(f"  {c}: {int(df[c].isna().sum())} bad")
+    # Excel-like: zeros included, NaNs ignored, column-only view
+    excel_like_mean = s_raw.mean()
 
-# Drop rows missing any available numeric cols
-df = df.dropna(subset=num_cols)
-if df.empty:
-    print("\n⚠️ All rows dropped after cleaning. Scores will be zero.")
-    brand_avg = df.groupby('Bidder_Name', as_index=False).size().drop(columns='size')
-    brand_avg['Score'] = 0.0
-else:
-    # ------------------ PER-BRAND AVERAGES ------------------
-    brand_avg = df.groupby('Bidder_Name', as_index=False)[num_cols].mean()
+    # Colwise-clean: treat zero as NA for ZERO_BAD, then mean (column-only view)
+    s_col = s_raw.copy()
+    if c in ZERO_BAD:
+        s_col = s_col.mask(s_col == 0, pd.NA)
+    colwise_clean_mean = s_col.mean()
 
-    # ------------------ NORMALIZE & SCORE ------------------
-    def minmax(s: pd.Series) -> pd.Series:
-        lo, hi = s.min(), s.max()
-        return (s - lo) / (hi - lo + 1e-12)
+    # Pipeline-style: drop rows that are invalid in ANY target column, then mean
+    # (this is where most mismatches happen)
+    mask_valid_all = pd.Series(True, index=df.index)
+    for cc in present:
+        s_tmp = df[cc]
+        if cc in ZERO_BAD:
+            s_tmp = s_tmp.mask(s_tmp == 0, pd.NA)
+        mask_valid_all &= s_tmp.notna()
+    s_pipe = df.loc[mask_valid_all, c]
+    pipeline_mean = s_pipe.mean()
 
-    norm_cols = []
-    for c in num_cols:
-        ncol = f"{c}_norm"
-        brand_avg[ncol] = (1 - minmax(brand_avg[c])) if c in LOWER_IS_BETTER else minmax(brand_avg[c])
-        norm_cols.append(ncol)
+    records.append({
+        "column": c,
+        "rows_total": rows_total,
+        "excel_like_nonNaN": int(s_raw.notna().sum()),
+        "excel_like_mean": float(excel_like_mean) if pd.notna(excel_like_mean) else None,
+        "colwise_clean_nonNaN": int(s_col.notna().sum()),
+        "colwise_clean_mean": float(colwise_clean_mean) if pd.notna(colwise_clean_mean) else None,
+        "pipeline_rows_used": int(mask_valid_all.sum()),
+        "pipeline_mean": float(pipeline_mean) if pd.notna(pipeline_mean) else None,
+        "zeros_count": int((s_raw == 0).sum())
+    })
 
-    # Equal-weight score across whatever norms exist
-    brand_avg['Score'] = brand_avg[norm_cols].mean(axis=1).fillna(0.0)
-
-# ------------------ RANK + TABLE ------------------
-brand_avg['Rank'] = brand_avg['Score'].rank(ascending=False, method='min').astype(int)
-brand_avg = brand_avg.sort_values(['Rank','Bidder_Name']).reset_index(drop=True)
-
-pd.set_option('display.max_columns', None)
-pd.set_option('display.width', None)
-print("\n=== Segregated Averages + Normalized Metrics + Score + Rank ===")
-print(brand_avg.to_string(index=False))
-
-# ------------------ PLOT TOP 10 ------------------
-top10 = brand_avg.head(10)
-plt.figure(figsize=(10,6))
-sns.barplot(data=top10, x='Score', y='Bidder_Name', palette='viridis')
-for i, v in enumerate(top10['Score']):
-    plt.text(float(v)+0.005, i, f"{v*100:.2f}%", va='center', fontsize=10, fontweight='bold')
-plt.title('Top 10 Brands with Highest Customer Value')
-plt.xlabel('Score')
-plt.ylabel('Brand')
-plt.tight_layout()
-plt.show()
+recon = pd.DataFrame.from_records(records)
+print("\n=== Reconciliation: Excel vs Clean (per column) vs Pipeline (all columns valid) ===")
+with pd.option_context("display.max_rows", None, "display.width", None):
+    print(recon.to_string(index=False))
