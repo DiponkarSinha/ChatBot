@@ -1,119 +1,273 @@
-import pandas as pd
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Rank EV brands by a weighted 'customer value' score.
+
+Inputs:
+  - A DataFrame with columns:
+      Bidder_Name, Price_USD, ERange_km, Elec_kWh_per_100km, Power_kW, Power_Train
+  - Optional weights for the scoring dimensions.
+
+Output:
+  - Cleaned & grouped brand table with normalized metrics and overall score.
+  - Optional bar plot of Top-N brands.
+
+Usage:
+  python brand_scoring.py  # if you add a CLI wrapper
+"""
+
+from __future__ import annotations
+import math
+from typing import Dict, Iterable, Tuple
+
 import numpy as np
+import pandas as pd
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# Replace this with your data loading method
-# df = pd.read_csv('your_data.csv')
 
-# List of specific brands
-brands = [
-    'bmw', 'volkswagen', 'mercedes-benz ag', 'volvo', 'toyota', 'ford',
-    'stellantis', 'nissan', 'kia', 'renault', 'byd', 'tesla', 'mazda',
-    'hyundai', 'polestar', 'gm', 'jlr', 'subaru'
-]
+# ----------------------------- Configuration ---------------------------------
 
+BRAND_UNIVERSE = {
+    # canonical name : set/list of aliases you expect in the data
+    "bmw": {"bmw"},
+    "volkswagen": {"volkswagen", "vw"},
+    "mercedes-benz ag": {"mercedes-benz ag", "mercedes", "mercedes-benz"},
+    "volvo": {"volvo"},
+    "toyota": {"toyota"},
+    "ford": {"ford"},
+    "stellantis": {"stellantis", "fiat chrysler", "fca", "peugeot", "citroen", "opel", "vauxhall"},
+    "nissan": {"nissan"},
+    "kia": {"kia"},
+    "renault": {"renault"},
+    "byd": {"byd"},
+    "tesla": {"tesla"},
+    "mazda": {"mazda"},
+    "hyundai": {"hyundai"},
+    "polestar": {"polestar"},
+    "gm": {"gm", "general motors", "chevrolet"},
+    "jlr": {"jlr", "jaguar land rover", "land rover", "jaguar"},
+    "subaru": {"subaru"},
+}
 
+VALID_POWERTRAINS = {"BEV", "PHEV", "MHEV", "FCEVs"}
 
-# --- Standardize 'Bidder_Name' ---
-df['Bidder_Name'] = df['Bidder_Name'].str.strip().str.lower()
+DEFAULT_WEIGHTS = {
+    # Higher is better for: Range, Power. Lower is better for: Price, Elec_kWh_per_100km.
+    "Price_USD": 0.25,            # inverted
+    "ERange_km": 0.35,            # direct
+    "Elec_kWh_per_100km": 0.20,   # inverted
+    "Power_kW": 0.20,             # direct
+}
 
-# --- Filter dataset for selected brands ---
-df = df[df['Bidder_Name'].isin(brands)]
-
-# --- Show raw averages before filtering ---
-raw_avg_price = df['Price_USD'].mean()
-raw_avg_range = df['ERange_km'].mean()
-raw_avg_ElectricKWH_Per_100k = df['Elec_kWh_per_100km'].mean()
-raw_avg_PowerKW = df['Power_kW'].mean()
-
-# --- Remove zeros and NaNs ---
-for col in ['Price_USD', 'ERange_km', 'Elec_kWh_per_100km', 'Power_kW']:
-    df = df[(df[col] != 0) & (~df[col].isna())]
-
-# --- Show filtered averages ---
-filtered_avg_price = df['Price_USD'].mean()
-filtered_avg_range = df['ERange_km'].mean()
-filtered_avg_ElectricKWH_Per_100k = df['Elec_kWh_per_100km'].mean()
-filtered_avg_PowerKW = df['Power_kW'].mean()
-
-
-# --- Filter electric vehicles ---
-ev_df = df[df['Power_Train'].isin(['BEV', 'PHEV', 'MHEV', 'FCEVs'])].copy()
-
-# --- Group by 'Bidder_Name' ---
-grouped = ev_df.groupby('Bidder_Name').agg({
-    'Price_USD': 'mean',
-    'ERange_km': 'mean',
-    'Elec_kWh_per_100km': 'mean',
-    'Power_kW': 'mean'
-}).reset_index()
-
-# --- Normalize function ---
-def normalize(arr, invert=False):
-    min_val = np.nanmin(arr)
-    max_val = np.nanmax(arr)
-    diff = max_val - min_val if max_val != min_val else 1
-    norm = (arr - min_val) / diff
-    return 1 - norm if invert else norm
-
-# --- Normalize metrics ---
-grouped['Price_norm'] = normalize(grouped['Price_USD'], invert=True)
-grouped['Range_norm'] = normalize(grouped['ERange_km'])
-grouped['Elec_kWh_norm'] = normalize(grouped['Elec_kWh_per_100km'])
-grouped['Power_kW_norm'] = normalize(grouped['Power_kW'])
-
-# --- Define weights ---
-#weights = np.array([0.2, 0.15, 0.1, 0.1])  # sum should be 1; adjust as needed
+TOP_N = 10  # how many brands to show
 
 
+# ------------------------------ Utilities ------------------------------------
 
-# --- Calculate overall score ---
-grouped['Customer_Score'] = (
-    weights[0] * grouped['Price_norm'] +
-    weights[1] * grouped['Range_norm'] +
-    weights[2] * grouped['Elec_kWh_norm'] +
-    weights[3] * grouped['Power_kW_norm']
-)
+def _casefold(s: str) -> str:
+    return str(s).strip().casefold()
 
-# --- Find Top 10 ---
-top10 = grouped.nlargest(10, 'Customer_Score')
-top10['Score_Percentage'] = top10['Customer_Score'] * 100
 
-# --- Create detailed tabular view ---
-detailed_view = top10[[
-    'Bidder_Name', 'Price_USD', 'ERange_km', 'Elec_kWh_per_100km', 'Power_kW',
-    'Price_norm', 'Range_norm', 'Elec_kWh_norm', 'Power_kW_norm',
-    'Customer_Score', 'Score_Percentage'
-]]
+def build_brand_alias_map(universe: Dict[str, Iterable[str]]) -> Dict[str, str]:
+    """Map any alias → canonical brand."""
+    alias_map = {}
+    for canonical, aliases in universe.items():
+        for a in aliases:
+            alias_map[_casefold(a)] = canonical
+        # also map the canonical itself
+        alias_map[_casefold(canonical)] = canonical
+    return alias_map
 
-# --- Rename columns for clarity ---
-detailed_view.columns = [
-    'Brand', 'Avg Price (USD)', 'Avg Range (km)', 'Avg Elec kWh/100km', 'Avg Power (kW)',
-    'Price Norm', 'Range Norm', 'Elec kWh Norm', 'Power kW Norm',
-    'Overall Score', 'Score Percentage'
-]
 
-# --- Show detailed table ---
-print("\n=== Top 10 Brands with Parameter Contributions ===")
-print(detailed_view.to_string(index=False))
+def validate_weights(weights: Dict[str, float], required: Iterable[str]) -> Dict[str, float]:
+    """Ensure weights cover required keys and sum to 1."""
+    missing = [k for k in required if k not in weights]
+    if missing:
+        raise ValueError(f"Missing weight(s): {missing}")
+    total = sum(weights.values())
+    if not math.isclose(total, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+        # normalize to 1.0 instead of erroring out
+        weights = {k: v / total for k, v in weights.items()}
+    return weights
 
-# --- Plot ---
-plt.figure(figsize=(12, 8))
-sns.barplot(
-    data=top10,
-    y='Bidder_Name',
-    x='Customer_Score',
-    palette='viridis'
-)
 
-plt.title('Top 10 Brands by Customer Value Score')
-plt.xlabel('Customer Value Score (Higher is better)')
-plt.ylabel('Brand')
+def robust_minmax(series: pd.Series, invert: bool = False) -> pd.Series:
+    """
+    Robust 0–1 scaling using 5th–95th percentile to reduce outlier impact.
+      - values below p5 -> p5, above p95 -> p95
+      - invert=True flips the scale so lower values get higher scores
+    """
+    s = pd.to_numeric(series, errors="coerce")
+    p5 = s.quantile(0.05)
+    p95 = s.quantile(0.95)
+    if pd.isna(p5) or pd.isna(p95) or p95 == p5:
+        # fallback to simple min-max if quantiles are degenerate
+        smin, smax = s.min(), s.max()
+        denom = (smax - smin) if smax != smin else 1.0
+        out = (s - smin) / denom
+    else:
+        s_clipped = s.clip(lower=p5, upper=p95)
+        out = (s_clipped - p5) / (p95 - p5)
+    return 1 - out if invert else out
 
-# Annotate each bar
-for i, val in enumerate(top10['Customer_Score']):
-    plt.text(val + 0.005, i, f"{val*100:.2f}%", va='center', fontsize=10, fontweight='bold')
 
-plt.tight_layout()
-plt.show()
+def drop_bad_values(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
+    """
+    Drop rows where any of the given columns are NaN or zero (for numeric).
+    Does not mutate the original frame.
+    """
+    out = df.copy()
+    for c in cols:
+        if c not in out.columns:
+            continue
+        if pd.api.types.is_numeric_dtype(out[c]):
+            out = out[(~out[c].isna()) & (out[c] != 0)]
+        else:
+            out = out[~out[c].isna()]
+    return out
+
+
+# ------------------------------ Main logic -----------------------------------
+
+def score_brands(
+    df: pd.DataFrame,
+    weights: Dict[str, float] = None,
+    brand_universe: Dict[str, Iterable[str]] = None,
+    valid_powertrains: Iterable[str] = None,
+    top_n: int = TOP_N,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Clean, filter, group, normalize and score brands. Returns (full_grouped, topN_view).
+    """
+
+    weights = validate_weights(weights or DEFAULT_WEIGHTS, DEFAULT_WEIGHTS.keys())
+    universe = brand_universe or BRAND_UNIVERSE
+    pt_set = set(valid_powertrains or VALID_POWERTRAINS)
+
+    required_cols = ["Bidder_Name", "Price_USD", "ERange_km", "Elec_kWh_per_100km", "Power_kW", "Power_Train"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Input DataFrame missing columns: {missing}")
+
+    # 1) Canonicalize brand names & filter to universe
+    alias_map = build_brand_alias_map(universe)
+    df = df.copy()
+    df["Bidder_Name"] = df["Bidder_Name"].map(lambda x: alias_map.get(_casefold(x), np.nan))
+    df = df[~df["Bidder_Name"].isna()]
+    df = df[df["Power_Train"].isin(pt_set)]
+
+    # Keep raw averages (pre-filter-for-zeros) for reference
+    raw_avgs = {
+        "Price_USD": df["Price_USD"].mean(),
+        "ERange_km": df["ERange_km"].mean(),
+        "Elec_kWh_per_100km": df["Elec_kWh_per_100km"].mean(),
+        "Power_kW": df["Power_kW"].mean(),
+    }
+
+    # 2) Drop zero / NaN rows for numeric scoring columns
+    score_cols = ["Price_USD", "ERange_km", "Elec_kWh_per_100km", "Power_kW"]
+    df_clean = drop_bad_values(df, score_cols)
+
+    filtered_avgs = {
+        "Price_USD": df_clean["Price_USD"].mean(),
+        "ERange_km": df_clean["ERange_km"].mean(),
+        "Elec_kWh_per_100km": df_clean["Elec_kWh_per_100km"].mean(),
+        "Power_kW": df_clean["Power_kW"].mean(),
+    }
+
+    # 3) Group by brand
+    grouped = (
+        df_clean.groupby("Bidder_Name", as_index=False)[score_cols].mean()
+        .rename(columns={"Bidder_Name": "Brand"})
+    )
+
+    if grouped.empty:
+        raise ValueError("No rows left after filtering—check brand aliases or data quality.")
+
+    # 4) Robust normalization (remember: lower price/consumption is better)
+    grouped["Price_norm"] = robust_minmax(grouped["Price_USD"], invert=True)
+    grouped["Range_norm"] = robust_minmax(grouped["ERange_km"], invert=False)
+    grouped["Elec_kWh_norm"] = robust_minmax(grouped["Elec_kWh_per_100km"], invert=True)
+    grouped["Power_kW_norm"] = robust_minmax(grouped["Power_kW"], invert=False)
+
+    # 5) Weighted customer score
+    grouped["Customer_Score"] = (
+        weights["Price_USD"]          * grouped["Price_norm"] +
+        weights["ERange_km"]          * grouped["Range_norm"] +
+        weights["Elec_kWh_per_100km"] * grouped["Elec_kWh_norm"] +
+        weights["Power_kW"]           * grouped["Power_kW_norm"]
+    )
+
+    # 6) Top-N nice view
+    topN = (grouped
+            .nlargest(top_n, "Customer_Score")
+            .assign(Score_Percentage=lambda d: d["Customer_Score"] * 100)
+            .loc[:, [
+                "Brand",
+                "Price_USD", "ERange_km", "Elec_kWh_per_100km", "Power_kW",
+                "Price_norm", "Range_norm", "Elec_kWh_norm", "Power_kW_norm",
+                "Customer_Score", "Score_Percentage",
+            ]])
+
+    # Attach summary (as attributes) for quick printing if needed
+    grouped.attrs["raw_avgs"] = raw_avgs
+    grouped.attrs["filtered_avgs"] = filtered_avgs
+    grouped.attrs["weights"] = weights
+
+    return grouped, topN
+
+
+def plot_topN(topN: pd.DataFrame, title: str = "Top Brands by Customer Value Score") -> None:
+    """Optional bar plot for the Top-N table."""
+    plt.figure(figsize=(12, 7))
+    sns.barplot(data=topN, y="Brand", x="Customer_Score")
+    plt.title(title)
+    plt.xlabel("Customer Value Score (higher is better)")
+    plt.ylabel("Brand")
+    # annotate
+    for i, (brand, score) in enumerate(zip(topN["Brand"], topN["Customer_Score"])):
+        plt.text(float(score) + 0.005, i, f"{score*100:.2f}%", va="center", fontsize=9, fontweight="bold")
+    plt.tight_layout()
+    plt.show()
+
+
+# ------------------------------ Example usage --------------------------------
+if __name__ == "__main__":
+    # Example: df = pd.read_csv("your_data.csv")
+    # For demo, create a tiny dummy frame (replace with real load)
+    data = {
+        "Bidder_Name": ["BMW", "Tesla", "Volkswagen", "Mercedes-Benz", "Kia", "BMW", "Tesla"],
+        "Price_USD": [52000, 48000, 41000, 65000, 33000, 54000, 50000],
+        "ERange_km": [420, 510, 380, 420, 360, 430, 520],
+        "Elec_kWh_per_100km": [18, 16, 17, 19, 16, 18, 15],
+        "Power_kW": [200, 250, 180, 220, 170, 210, 260],
+        "Power_Train": ["BEV", "BEV", "BEV", "BEV", "PHEV", "BEV", "BEV"],
+    }
+    df = pd.DataFrame(data)
+
+    # Optional: tweak weights
+    weights = {
+        "Price_USD": 0.25,
+        "ERange_km": 0.40,
+        "Elec_kWh_per_100km": 0.20,
+        "Power_kW": 0.15,
+    }
+
+    grouped, topN = score_brands(df, weights=weights, top_n=5)
+
+    # Print summaries
+    print("\n=== Raw Averages (pre zero/NaN filter) ===")
+    print(grouped.attrs["raw_avgs"])
+    print("\n=== Filtered Averages ===")
+    print(grouped.attrs["filtered_avgs"])
+    print("\n=== Weights Used ===")
+    print(grouped.attrs["weights"])
+
+    print("\n=== Top Brands (detailed) ===")
+    with pd.option_context("display.max_columns", None, "display.width", 120):
+        print(topN.to_string(index=False))
+
+    # Plot (optional)
+    plot_topN(topN)
