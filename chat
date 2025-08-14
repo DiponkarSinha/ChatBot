@@ -2,7 +2,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# --- Config ---
 CSV_PATH = "your_data.csv"
 BRANDS = [
     'bmw','volkswagen','mercedes-benz ag','volvo','toyota','ford','stellantis','nissan',
@@ -10,70 +9,72 @@ BRANDS = [
 ]
 NUM_COLS = [
     'Motor_cc', 'CO2_g_per_km', 'Fuel_L_per_100km',
-    'Elec_kWh_per_100km', 'Power_kW', 'Price_USD'
+    'Elec_kWh_per_100km', 'Power_kW', 'Price_USD'   # <- Power_kW (correct)
 ]
 
-# --- Load ---
+# ---- Load
 df = pd.read_csv(CSV_PATH)
+print("DEBUG columns:", list(df.columns))  # quick check
+
 df['Bidder_Name'] = df['Bidder_Name'].str.strip().str.lower()
 df = df[df['Bidder_Name'].isin(BRANDS)].copy()
 
-# --- Convert numeric columns safely ---
-for col in NUM_COLS:
-    df[col] = pd.to_numeric(df[col], errors='coerce')
+# ---- Convert to numeric & clean
+available = [c for c in NUM_COLS if c in df.columns]
+missing = set(NUM_COLS) - set(available)
+if missing:
+    print("⚠️ Missing columns (skipped):", missing)
 
-# --- Replace unrealistic zeros with NaN ---
-zero_invalid_cols = ['Motor_cc', 'Power_kW', 'Fuel_L_per_100km', 'Price_USD']
-df[zero_invalid_cols] = df[zero_invalid_cols].replace(0, pd.NA)
+for c in available:
+    df[c] = pd.to_numeric(df[c], errors='coerce')
 
-# --- Debug: Show rows with missing values ---
-print("\n=== DEBUG: Rows with missing or invalid values ===")
-for col in NUM_COLS:
-    bad_rows = df[df[col].isna()]
-    if not bad_rows.empty:
-        print(f"\n❌ Column '{col}' has {len(bad_rows)} bad rows:")
-        print(bad_rows[['Bidder_Name', col]].to_string(index=False))
+# treat unrealistic zeros as missing for these
+zero_invalid = [c for c in ['Motor_cc','Power_kW','Fuel_L_per_100km','Price_USD'] if c in available]
+df[zero_invalid] = df[zero_invalid].replace(0, pd.NA)
 
-# --- Drop rows missing in any numeric column ---
-df = df.dropna(subset=NUM_COLS)
+# ---- Debug: show bad rows per numeric column
+print("\n=== DEBUG: rows with missing/invalid values by column ===")
+for c in available:
+    n_bad = df[c].isna().sum()
+    if n_bad:
+        print(f"{c}: {n_bad} bad rows")
 
-# --- Per-brand averages ---
-brand_avg = df.groupby('Bidder_Name', as_index=False)[NUM_COLS].mean()
+# drop incomplete rows for scoring
+df = df.dropna(subset=available)
 
-# --- Normalization function ---
-def minmax(series):
-    lo, hi = series.min(), series.max()
-    return (series - lo) / (hi - lo + 1e-12)
+# ---- Per-brand averages
+brand_avg = df.groupby('Bidder_Name', as_index=False)[available].mean()
 
-# --- Normalize ---
-brand_avg['Motor_norm']     =     minmax(brand_avg['Motor_cc'])               # higher better
-brand_avg['CO2_norm']       = 1 - minmax(brand_avg['CO2_g_per_km'])           # lower better
-brand_avg['Fuel_norm']      = 1 - minmax(brand_avg['Fuel_L_per_100km'])       # lower better
-brand_avg['Elec_kWh_norm']  = 1 - minmax(brand_avg['Elec_kWh_per_100km'])     # lower better
-brand_avg['Power_norm']     =     minmax(brand_avg['Power_kW'])               # higher better
-brand_avg['Price_norm']     = 1 - minmax(brand_avg['Price_USD'])              # lower better
+# ---- Normalization
+def minmax(s):
+    lo, hi = s.min(), s.max()
+    return (s - lo) / (hi - lo + 1e-12)
 
-# --- Score ---
-brand_avg['Score'] = brand_avg[[
-    'Motor_norm','CO2_norm','Fuel_norm',
-    'Elec_kWh_norm','Power_norm','Price_norm'
-]].mean(axis=1)
+# lower is better for these:
+invert_cols = {'CO2_g_per_km','Fuel_L_per_100km','Elec_kWh_per_100km','Price_USD'}
 
+for c in available:
+    ncol = c + "_norm"
+    brand_avg[ncol] = (1 - minmax(brand_avg[c])) if c in invert_cols else minmax(brand_avg[c])
+
+# ---- Score (equal weights of whatever norms exist)
+norm_cols = [c for c in brand_avg.columns if c.endswith("_norm")]
+brand_avg['Score'] = brand_avg[norm_cols].mean(axis=1)
 brand_avg['Rank'] = brand_avg['Score'].rank(ascending=False).astype(int)
 brand_avg = brand_avg.sort_values('Rank')
 
-# --- Table view ---
+# ---- Final table
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)
 print("\n=== Full Scoring Table ===")
 print(brand_avg.to_string(index=False))
 
-# --- Plot ---
+# ---- Plot Top 10
 top10 = brand_avg.head(10)
 plt.figure(figsize=(10,6))
 sns.barplot(data=top10, x='Score', y='Bidder_Name', palette='viridis')
-for i, val in enumerate(top10['Score']):
-    plt.text(val + 0.005, i, f"{val*100:.2f}%", va='center', fontsize=10, fontweight='bold')
+for i, v in enumerate(top10['Score']):
+    plt.text(float(v)+0.005, i, f"{v*100:.2f}%", va='center', fontsize=10, fontweight='bold')
 plt.title('Top 10 Brands with Highest Customer Value')
 plt.xlabel('Score')
 plt.ylabel('Brand')
