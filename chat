@@ -1,1 +1,104 @@
-['Bidder_Name', 'star', 'Model', 'Lot_ID', 'JnJ_Region', 'Eligibility_Classification', 'Transmission', 'Motor_Size_in_cc', 'Motor_Power_in_kw', 'Power_Train', 'Is_Apple_Carplay_or_Android_Auto_Available_in_this_model', 'CO2_Emission_in_g_km', 'Average_Fuel_Consumption_in_liter_100km', 'Average_Electricity_Consumption_in_Kwh_100km', 'Battery_size_in_kWh', 'Electric_Range_in_km', 'Total_time_to_fully_charge_from_empty_to_full_using_a_7KW_in_minutes', 'Vehicle_List_Price_including_Discounts_in_USD', 'List_of_crash_tests_the_vehicle_posses_Name_date_score', 'Does the vehicle have telematic capabilities?']
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ------------------ CONFIG ------------------
+CSV_PATH = "your_data.csv"   # <- change to your file
+BRANDS = [
+    'bmw','volkswagen','mercedes-benz ag','volvo','toyota','ford','stellantis','nissan',
+    'kia','renault','byd','tesla','mazda','hyundai','polestar','gm','jlr','subaru'
+]
+
+# Map YOUR column names -> canonical names we’ll use below
+RENAME = {
+    'Motor_Size_in_cc': 'Motor_cc',
+    'Motor_Power_in_kw': 'Power_kW',
+    'CO2_Emission_in_g_km': 'CO2_g_per_km',
+    'Average_Fuel_Consumption_in_liter_100km': 'Fuel_L_per_100km',
+    'Average_Electricity_Consumption_in_Kwh_100km': 'Elec_kWh_per_100km',
+    'Electric_Range_in_km': 'ERange_km',
+    'Vehicle_List_Price_including_Discounts_in_USD': 'Price_USD',
+}
+
+REQUIRED = ['Bidder_Name','Motor_cc','CO2_g_per_km','Fuel_L_per_100km',
+            'Elec_kWh_per_100km','Power_kW','Price_USD','ERange_km']
+
+LOWER_IS_BETTER = {'CO2_g_per_km','Fuel_L_per_100km','Elec_kWh_per_100km','Price_USD'}  # lower better
+
+# ------------------ LOAD & RENAME ------------------
+df = pd.read_csv(CSV_PATH)
+print("DEBUG: original columns:\n", list(df.columns))
+
+df = df.rename(columns=RENAME)
+print("\nDEBUG: after renaming:\n", list(df.columns))
+
+# Check presence
+missing = [c for c in REQUIRED if c not in df.columns]
+if missing:
+    print("\n⚠️ These required columns are missing and will be skipped in scoring:", missing)
+
+# ------------------ FILTER BRANDS ------------------
+df['Bidder_Name'] = df['Bidder_Name'].astype(str).str.strip().str.lower()
+df = df[df['Bidder_Name'].isin(BRANDS)].copy()
+if df.empty:
+    raise ValueError("No rows remain after brand filter. Check brand names.")
+
+# ------------------ NUMERIC CLEAN ------------------
+num_cols = [c for c in REQUIRED if c != 'Bidder_Name' and c in df.columns]
+for c in num_cols:
+    df[c] = pd.to_numeric(df[c], errors='coerce')
+
+# zeros → NA for fields that shouldn’t be zero
+for c in ['Motor_cc','Power_kW','Fuel_L_per_100km','Price_USD']:
+    if c in df.columns:
+        df[c] = df[c].replace(0, pd.NA)
+
+# Debug: bad counts
+print("\nDEBUG: missing/invalid counts per numeric column:")
+for c in num_cols:
+    print(f"  {c}: {int(df[c].isna().sum())} bad")
+
+# Drop rows missing any available numeric cols
+df = df.dropna(subset=num_cols)
+if df.empty:
+    print("\n⚠️ All rows dropped after cleaning. Scores will be zero.")
+    brand_avg = df.groupby('Bidder_Name', as_index=False).size().drop(columns='size')
+    brand_avg['Score'] = 0.0
+else:
+    # ------------------ PER-BRAND AVERAGES ------------------
+    brand_avg = df.groupby('Bidder_Name', as_index=False)[num_cols].mean()
+
+    # ------------------ NORMALIZE & SCORE ------------------
+    def minmax(s: pd.Series) -> pd.Series:
+        lo, hi = s.min(), s.max()
+        return (s - lo) / (hi - lo + 1e-12)
+
+    norm_cols = []
+    for c in num_cols:
+        ncol = f"{c}_norm"
+        brand_avg[ncol] = (1 - minmax(brand_avg[c])) if c in LOWER_IS_BETTER else minmax(brand_avg[c])
+        norm_cols.append(ncol)
+
+    # Equal-weight score across whatever norms exist
+    brand_avg['Score'] = brand_avg[norm_cols].mean(axis=1).fillna(0.0)
+
+# ------------------ RANK + TABLE ------------------
+brand_avg['Rank'] = brand_avg['Score'].rank(ascending=False, method='min').astype(int)
+brand_avg = brand_avg.sort_values(['Rank','Bidder_Name']).reset_index(drop=True)
+
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', None)
+print("\n=== Segregated Averages + Normalized Metrics + Score + Rank ===")
+print(brand_avg.to_string(index=False))
+
+# ------------------ PLOT TOP 10 ------------------
+top10 = brand_avg.head(10)
+plt.figure(figsize=(10,6))
+sns.barplot(data=top10, x='Score', y='Bidder_Name', palette='viridis')
+for i, v in enumerate(top10['Score']):
+    plt.text(float(v)+0.005, i, f"{v*100:.2f}%", va='center', fontsize=10, fontweight='bold')
+plt.title('Top 10 Brands with Highest Customer Value')
+plt.xlabel('Score')
+plt.ylabel('Brand')
+plt.tight_layout()
+plt.show()
