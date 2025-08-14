@@ -2,7 +2,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# --- Config ---
+# -------------------
+# CONFIGURATION
+# -------------------
 CSV_PATH = "your_data.csv"
 BRANDS = [
     'bmw','volkswagen','mercedes-benz ag','volvo','toyota','ford','stellantis','nissan',
@@ -13,25 +15,30 @@ NUM_COLS = [
     'Elec_kWh_per_100km', 'Power_kW', 'Price_USD'
 ]
 
-# --- Load & clean ---
+# -------------------
+# LOAD & FILTER DATA
+# -------------------
 df = pd.read_csv(CSV_PATH)
 df['Bidder_Name'] = df['Bidder_Name'].str.strip().str.lower()
 df = df[df['Bidder_Name'].isin(BRANDS)].copy()
 
-# Drop rows with NaN or 0 in numeric columns
+# Remove NaNs and zeros
 df = df.dropna(subset=NUM_COLS)
 for col in NUM_COLS:
     df = df[df[col] != 0]
 
-# --- Per-brand averages ---
+# -------------------
+# PER-BRAND AVERAGES
+# -------------------
 brand_avg = df.groupby('Bidder_Name', as_index=False)[NUM_COLS].mean()
 
-# --- Normalization function ---
+# -------------------
+# NORMALIZATION
+# -------------------
 def minmax(series):
     lo, hi = series.min(), series.max()
     return (series - lo) / (hi - lo + 1e-12)
 
-# --- Normalized metrics ---
 brand_avg['Motor_norm']     =     minmax(brand_avg['Motor_cc'])               # higher better
 brand_avg['CO2_norm']       = 1 - minmax(brand_avg['CO2_g_per_km'])           # lower better
 brand_avg['Fuel_norm']      = 1 - minmax(brand_avg['Fuel_L_per_100km'])       # lower better
@@ -39,23 +46,29 @@ brand_avg['Elec_kWh_norm']  = 1 - minmax(brand_avg['Elec_kWh_per_100km'])     # 
 brand_avg['Power_norm']     =     minmax(brand_avg['Power_kW'])               # higher better
 brand_avg['Price_norm']     = 1 - minmax(brand_avg['Price_USD'])              # lower better
 
-# --- Score (equal weights) ---
+# -------------------
+# FINAL SCORE
+# -------------------
 brand_avg['Score'] = brand_avg[[
     'Motor_norm','CO2_norm','Fuel_norm',
     'Elec_kWh_norm','Power_norm','Price_norm'
 ]].mean(axis=1)
 
-# --- Rank ---
 brand_avg['Rank'] = brand_avg['Score'].rank(ascending=False).astype(int)
-
-# --- Sort by rank ---
 brand_avg = brand_avg.sort_values('Rank')
 
-# --- Show final table ---
-print("\n=== Full Scoring Table ===")
+# -------------------
+# DISPLAY FULL TABLE
+# -------------------
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', None)
+
+print("\n=== Segregated Averages, Normalized Values, and Scores ===")
 print(brand_avg.to_string(index=False))
 
-# --- Top 10 plot ---
+# -------------------
+# PLOT TOP 10 BRANDS
+# -------------------
 top10 = brand_avg.head(10)
 plt.figure(figsize=(10,6))
 sns.barplot(data=top10, x='Score', y='Bidder_Name', palette='viridis')
