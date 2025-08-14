@@ -1,0 +1,119 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Replace this with your data loading method
+# df = pd.read_csv('your_data.csv')
+
+# List of specific brands
+brands = [
+    'bmw', 'volkswagen', 'mercedes-benz ag', 'volvo', 'toyota', 'ford',
+    'stellantis', 'nissan', 'kia', 'renault', 'byd', 'tesla', 'mazda',
+    'hyundai', 'polestar', 'gm', 'jlr', 'subaru'
+]
+
+
+
+# --- Standardize 'Bidder_Name' ---
+df['Bidder_Name'] = df['Bidder_Name'].str.strip().str.lower()
+
+# --- Filter dataset for selected brands ---
+df = df[df['Bidder_Name'].isin(brands)]
+
+# --- Show raw averages before filtering ---
+raw_avg_price = df['Price_USD'].mean()
+raw_avg_range = df['ERange_km'].mean()
+raw_avg_ElectricKWH_Per_100k = df['Elec_kWh_per_100km'].mean()
+raw_avg_PowerKW = df['Power_kW'].mean()
+
+# --- Remove zeros and NaNs ---
+for col in ['Price_USD', 'ERange_km', 'Elec_kWh_per_100km', 'Power_kW']:
+    df = df[(df[col] != 0) & (~df[col].isna())]
+
+# --- Show filtered averages ---
+filtered_avg_price = df['Price_USD'].mean()
+filtered_avg_range = df['ERange_km'].mean()
+filtered_avg_ElectricKWH_Per_100k = df['Elec_kWh_per_100km'].mean()
+filtered_avg_PowerKW = df['Power_kW'].mean()
+
+
+# --- Filter electric vehicles ---
+ev_df = df[df['Power_Train'].isin(['BEV', 'PHEV', 'MHEV', 'FCEVs'])].copy()
+
+# --- Group by 'Bidder_Name' ---
+grouped = ev_df.groupby('Bidder_Name').agg({
+    'Price_USD': 'mean',
+    'ERange_km': 'mean',
+    'Elec_kWh_per_100km': 'mean',
+    'Power_kW': 'mean'
+}).reset_index()
+
+# --- Normalize function ---
+def normalize(arr, invert=False):
+    min_val = np.nanmin(arr)
+    max_val = np.nanmax(arr)
+    diff = max_val - min_val if max_val != min_val else 1
+    norm = (arr - min_val) / diff
+    return 1 - norm if invert else norm
+
+# --- Normalize metrics ---
+grouped['Price_norm'] = normalize(grouped['Price_USD'], invert=True)
+grouped['Range_norm'] = normalize(grouped['ERange_km'])
+grouped['Elec_kWh_norm'] = normalize(grouped['Elec_kWh_per_100km'])
+grouped['Power_kW_norm'] = normalize(grouped['Power_kW'])
+
+# --- Define weights ---
+#weights = np.array([0.2, 0.15, 0.1, 0.1])  # sum should be 1; adjust as needed
+
+
+
+# --- Calculate overall score ---
+grouped['Customer_Score'] = (
+    weights[0] * grouped['Price_norm'] +
+    weights[1] * grouped['Range_norm'] +
+    weights[2] * grouped['Elec_kWh_norm'] +
+    weights[3] * grouped['Power_kW_norm']
+)
+
+# --- Find Top 10 ---
+top10 = grouped.nlargest(10, 'Customer_Score')
+top10['Score_Percentage'] = top10['Customer_Score'] * 100
+
+# --- Create detailed tabular view ---
+detailed_view = top10[[
+    'Bidder_Name', 'Price_USD', 'ERange_km', 'Elec_kWh_per_100km', 'Power_kW',
+    'Price_norm', 'Range_norm', 'Elec_kWh_norm', 'Power_kW_norm',
+    'Customer_Score', 'Score_Percentage'
+]]
+
+# --- Rename columns for clarity ---
+detailed_view.columns = [
+    'Brand', 'Avg Price (USD)', 'Avg Range (km)', 'Avg Elec kWh/100km', 'Avg Power (kW)',
+    'Price Norm', 'Range Norm', 'Elec kWh Norm', 'Power kW Norm',
+    'Overall Score', 'Score Percentage'
+]
+
+# --- Show detailed table ---
+print("\n=== Top 10 Brands with Parameter Contributions ===")
+print(detailed_view.to_string(index=False))
+
+# --- Plot ---
+plt.figure(figsize=(12, 8))
+sns.barplot(
+    data=top10,
+    y='Bidder_Name',
+    x='Customer_Score',
+    palette='viridis'
+)
+
+plt.title('Top 10 Brands by Customer Value Score')
+plt.xlabel('Customer Value Score (Higher is better)')
+plt.ylabel('Brand')
+
+# Annotate each bar
+for i, val in enumerate(top10['Customer_Score']):
+    plt.text(val + 0.005, i, f"{val*100:.2f}%", va='center', fontsize=10, fontweight='bold')
+
+plt.tight_layout()
+plt.show()
