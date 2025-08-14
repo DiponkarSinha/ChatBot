@@ -1,56 +1,60 @@
 import pandas as pd
-import numpy as np
-import seaborn as sns
 import matplotlib.pyplot as plt
+import seaborn as sns
 
-# Load data
-df = pd.read_csv("your_data.csv")
-
-# List of brands to include
-brands = [
-    'bmw', 'volkswagen', 'mercedes-benz ag', 'volvo', 'toyota', 'ford',
-    'stellantis', 'nissan', 'kia', 'renault', 'byd', 'tesla', 'mazda',
-    'hyundai', 'polestar', 'gm', 'jlr', 'subaru'
+# --- Config ---
+CSV_PATH = "your_data.csv"
+BRANDS = [
+    'bmw','volkswagen','mercedes-benz ag','volvo','toyota','ford','stellantis','nissan',
+    'kia','renault','byd','tesla','mazda','hyundai','polestar','gm','jlr','subaru'
 ]
+NUM_COLS = ['Price_USD', 'ERange_km', 'Elec_kWh_per_100km', 'Power_kW']
 
-# Standardize brand names
+# --- Load & clean ---
+df = pd.read_csv(CSV_PATH)
 df['Bidder_Name'] = df['Bidder_Name'].str.strip().str.lower()
+df = df[df['Bidder_Name'].isin(BRANDS)].copy()
 
-# Filter by brand list
-df = df[df['Bidder_Name'].isin(brands)]
-
-# Remove rows with NaN or 0 in key numeric columns
-num_cols = ['Price_USD', 'ERange_km', 'Elec_kWh_per_100km', 'Power_kW']
-df = df.dropna(subset=num_cols)
-for col in num_cols:
+# Drop rows with NaN or 0 in numeric columns
+df = df.dropna(subset=NUM_COLS)
+for col in NUM_COLS:
     df = df[df[col] != 0]
 
-# Show averages of numeric parameters
-avg_table = df[num_cols].mean().reset_index()
-avg_table.columns = ['Parameter', 'Average']
-print("\n=== Average of All Numeric Parameters ===")
-print(avg_table.to_string(index=False))
+# --- Per-brand averages ---
+brand_avg = df.groupby('Bidder_Name', as_index=False)[NUM_COLS].mean()
 
-# Group by brand & calculate averages
-grouped = df.groupby('Bidder_Name')[num_cols].mean().reset_index()
+# --- Normalization function ---
+def minmax(series):
+    lo, hi = series.min(), series.max()
+    return (series - lo) / (hi - lo + 1e-12)
 
-# Normalize each metric (invert price & Elec_kWh for scoring)
-grouped['Price_norm'] = (grouped['Price_USD'].max() - grouped['Price_USD']) / (grouped['Price_USD'].max() - grouped['Price_USD'].min())
-grouped['Range_norm'] = (grouped['ERange_km'] - grouped['ERange_km'].min()) / (grouped['ERange_km'].max() - grouped['ERange_km'].min())
-grouped['Elec_kWh_norm'] = (grouped['Elec_kWh_per_100km'].max() - grouped['Elec_kWh_per_100km']) / (grouped['Elec_kWh_per_100km'].max() - grouped['Elec_kWh_per_100km'].min())
-grouped['Power_norm'] = (grouped['Power_kW'] - grouped['Power_kW'].min()) / (grouped['Power_kW'].max() - grouped['Power_kW'].min())
+# --- Normalized metrics ---
+brand_avg['Price_norm']     = 1 - minmax(brand_avg['Price_USD'])             # lower better
+brand_avg['Range_norm']     =     minmax(brand_avg['ERange_km'])             # higher better
+brand_avg['Elec_kWh_norm']  = 1 - minmax(brand_avg['Elec_kWh_per_100km'])    # lower better
+brand_avg['Power_norm']     =     minmax(brand_avg['Power_kW'])              # higher better
 
-# Final score (equal weights)
-grouped['Score'] = grouped[['Price_norm', 'Range_norm', 'Elec_kWh_norm', 'Power_norm']].mean(axis=1)
+# --- Score (equal weights) ---
+brand_avg['Score'] = brand_avg[['Price_norm','Range_norm','Elec_kWh_norm','Power_norm']].mean(axis=1)
 
-# Get Top 10 brands
-top10 = grouped.sort_values('Score', ascending=False).head(10)
+# --- Rank ---
+brand_avg['Rank'] = brand_avg['Score'].rank(ascending=False).astype(int)
 
-print("\n=== Top 10 Brands by Score ===")
-print(top10[['Bidder_Name', 'Score']].to_string(index=False))
+# --- Sort by rank ---
+brand_avg = brand_avg.sort_values('Rank')
 
-# Plot Top 10
+# --- Show final table ---
+print("\n=== Full Scoring Table ===")
+print(brand_avg.to_string(index=False))
+
+# --- Top 10 plot ---
+top10 = brand_avg.head(10)
 plt.figure(figsize=(10,6))
 sns.barplot(data=top10, x='Score', y='Bidder_Name', palette='viridis')
+for i, val in enumerate(top10['Score']):
+    plt.text(val + 0.005, i, f"{val*100:.2f}%", va='center', fontsize=10, fontweight='bold')
 plt.title('Top 10 Brands by Score')
+plt.xlabel('Score')
+plt.ylabel('Brand')
+plt.tight_layout()
 plt.show()
